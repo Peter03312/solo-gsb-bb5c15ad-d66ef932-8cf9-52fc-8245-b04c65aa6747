@@ -28,8 +28,9 @@ CREATE TABLE IF NOT EXISTS documents (
     owner_id     INTEGER NOT NULL REFERENCES users(id),
     body         TEXT NOT NULL,
     digest       TEXT NOT NULL,
-    status       TEXT NOT NULL CHECK (status IN ('sealed', 'opened')),
+    status       TEXT NOT NULL CHECK (status IN ('sealed', 'opened', 'purged')),
     opened_at    TEXT,
+    purged_at    TEXT,
     created_at   TEXT NOT NULL
 );
 
@@ -69,6 +70,21 @@ CREATE UNIQUE INDEX IF NOT EXISTS idx_handover_one_pending
     ON handover_invitations(document_id) WHERE status = 'pending';
 CREATE INDEX IF NOT EXISTS idx_handover_document ON handover_invitations(document_id);
 
+-- 到期清除安排：每份资料至多一份 scheduled（未到期、未取消）的安排
+-- （部分唯一索引兜底并发）；到期后正文被清空、资料置为 purged 并回写清除时刻。
+CREATE TABLE IF NOT EXISTS purge_schedules (
+    id           INTEGER PRIMARY KEY,
+    document_id  INTEGER NOT NULL REFERENCES documents(id),
+    purge_at     TEXT NOT NULL,            -- 带时区清除时刻（UTC 存储，字符串可排序）
+    status       TEXT NOT NULL CHECK (status IN ('scheduled', 'done', 'cancelled')),
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,            -- 最近一次安排/改期时刻
+    resolved_at  TEXT                      -- 实际清除/取消时刻
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_purge_one_scheduled
+    ON purge_schedules(document_id) WHERE status = 'scheduled';
+CREATE INDEX IF NOT EXISTS idx_purge_document ON purge_schedules(document_id);
+
 CREATE TABLE IF NOT EXISTS approvals (
     id           INTEGER PRIMARY KEY,
     request_id   INTEGER NOT NULL REFERENCES open_requests(id) ON DELETE CASCADE,
@@ -105,7 +121,8 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
     return conn
 
 
-# 旧库迁移（幂等）：补 earliest_open_at 列，并在 CHECK 约束不含 waiting/invalidated 时重建表
+# 旧库迁移（幂等）：补 earliest_open_at / purged_at 列，并在 CHECK 约束不含
+# waiting/invalidated（open_requests）或 purged（documents）时重建对应表。
 _WAITING_CHECK = re.compile(r"CHECK\s*\(\s*status\s+IN\s*\(([^)]*)\)", re.IGNORECASE)
 _MIGRATION_REBUILD = """
 CREATE TABLE open_requests_new (
@@ -125,6 +142,23 @@ ALTER TABLE open_requests_new RENAME TO open_requests;
 CREATE INDEX IF NOT EXISTS idx_open_requests_document ON open_requests(document_id);
 """
 
+_DOCUMENTS_REBUILD = """
+CREATE TABLE documents_new (
+    id           INTEGER PRIMARY KEY,
+    owner_id     INTEGER NOT NULL REFERENCES users(id),
+    body         TEXT NOT NULL,
+    digest       TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('sealed', 'opened', 'purged')),
+    opened_at    TEXT,
+    purged_at    TEXT,
+    created_at   TEXT NOT NULL
+);
+INSERT INTO documents_new (id, owner_id, body, digest, status, opened_at, purged_at, created_at)
+SELECT id, owner_id, body, digest, status, opened_at, purged_at, created_at FROM documents;
+DROP TABLE documents;
+ALTER TABLE documents_new RENAME TO documents;
+"""
+
 
 def init_db(db_path: str | None = None) -> None:
     """幂等初始化：创建库表并开启 WAL / 外键（容器初始化时与应用启动时各调用一次也安全）。"""
@@ -132,6 +166,19 @@ def init_db(db_path: str | None = None) -> None:
     try:
         conn.executescript(SCHEMA)
         # 旧版库迁移：CREATE TABLE IF NOT EXISTS 不会更新既有表结构
+        doc_cols = {r["name"] for r in conn.execute("PRAGMA table_info(documents)")}
+        if "purged_at" not in doc_cols:
+            conn.execute("ALTER TABLE documents ADD COLUMN purged_at TEXT")
+        doc_sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='documents'"
+        ).fetchone()["sql"]
+        m = _WAITING_CHECK.search(doc_sql)
+        doc_allowed = m.group(1).replace('"', "'").lower() if m else ""
+        if m is None or "'purged'" not in doc_allowed:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.executescript(_DOCUMENTS_REBUILD)
+            conn.execute("PRAGMA foreign_keys=ON")
+
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(open_requests)")}
         if "earliest_open_at" not in cols:
             conn.execute("ALTER TABLE open_requests ADD COLUMN earliest_open_at TEXT")

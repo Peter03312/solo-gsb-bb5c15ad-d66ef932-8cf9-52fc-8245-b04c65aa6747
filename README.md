@@ -5,7 +5,9 @@
 **两名不同指定见证人**分别同意；同意必须绑定本次请求与封存时的摘要。
 资料未开封时，封存人可在见证人无法履职后**替换指定见证人**，新见证人可继续为
 进行中的开封请求补票；封存人也可就未开封资料向另一名本地账号**发起交接邀请**，
-受让人在截止前确认后成为新封存人。技术栈：Python 3.11 + FastAPI + SQLite。
+受让人在截止前确认后成为新封存人。封存人还可为资料**安排带时区的到期清除时刻**，
+到期自动清空正文（保留摘要、参与方与审计元数据），到期前可改期或取消，交接后由
+新封存人管理。技术栈：Python 3.11 + FastAPI + SQLite。
 
 ## 安全与业务规则
 
@@ -28,8 +30,13 @@
 | 交接确认结算顺序 | 确认临界区先做确定性到点开封与开封请求到期判定：资料若已开封则拒绝交接；否则进行中的开封请求置 `invalidated`（过截止时刻的按原规则置 `expired`）并删除全部旧同意，再转移封存人身份；见证名单、正文、摘要不变 |
 | 交接后权限 | 原封存人立即失去该资料的查看/操作权限（统一 403，不区分资料是否存在）；新封存人可重新申请开封，新请求从 0 票开始；开封前任何接口与错误体都不含正文 |
 | 邀请生命周期 | `pending` 邀请可撤回（`revoked`）或逾期（`expired`，后台扫描与每个交接写事务都会确定性判定）；已撤回/逾期/资料开封后均不可确认；撤回或逾期后封存人可重新邀请；资料开封会连带使待确认邀请失效 |
-| 拒绝且状态不变 | 失效凭据(401)、非见证人(403)、无效时限(400/422)、重复开封(409) 等任何拒绝路径都不写数据（到点自动开封的提交除外：开封先落库，拒绝在提交后返回） |
-| 并发只产生一个结果 | 全部“检查 + 写入”在 SQLite `BEGIN IMMEDIATE` 短事务内完成；并发同意/撤销/定时开封/到期/替换见证人/交接发起、撤回、确认只有一个已提交终态（同意在锁内以“当前名单”复核见证人身份；交接与第二票同意赛跑时要么开封要么交接，互斥且唯一） |
+| 到期清除安排 | 封存人凭现有密钥提交带时区的未来清除时刻 `purge_at`（必须晚于当前）；每份资料同时至多一份未到期（`scheduled`）安排（部分唯一索引兜底并发）；到期前当前封存人可改期或取消（`cancelled`，取消后可重新安排）；交接后安排随资料由新封存人管理，原封存人无权操作（统一 403） |
+| 清除结果 | 到点确定性清除（**不依赖扫描器准时**：后台扫描器、每个写事务与参与方查询进入临界区都先做清除判定）：清空 `documents.body`、状态置为 `purged`、回写 `purged_at`；保留摘要、参与方（封存人/见证人）与全部审计元数据；此后查询/列表/审计及任何写操作都不再返回正文 |
+| 清除连带失效 | 未开封资料清除时，进行中（`pending`/`waiting`）的开封请求置 `invalidated` 且其全部旧同意删除（旧同意永久作废），待确认交接邀请置 `expired`；已开封资料仍按期清除，开封记录作为历史保留（不再返回正文与见证明细） |
+| 清除与开封同刻 | **清除优先**：清除与最早开封为同一时刻时，即使第二票同意/交接确认同时到达，也只形成“已清除”一个结果（开封请求随清除 `invalidated`）；开封时刻更早则先开封，随后按已开封资料清除 |
+| 已清除不可操作 | 已清除资料不能再开封、替换见证人或发起/确认交接；其清除安排不能改期/取消/重复安排；无权(403)、无效时刻(400/422)、已到期后的改期/取消(409) 一律拒绝且错误体不含正文 |
+| 拒绝且状态不变 | 失效凭据(401)、非见证人(403)、无效时限(400/422)、重复开封(409) 等任何拒绝路径都不写数据（到点自动开封/到期清除的提交除外：清除或开封先落库，拒绝在提交后返回） |
+| 并发只产生一个结果 | 全部“检查 + 写入”在 SQLite `BEGIN IMMEDIATE` 短事务内完成；并发同意/撤销/定时开封/到期/替换见证人/交接发起、撤回、确认/到期清除只有一个已提交终态（同意在锁内以“当前名单”复核见证人身份；交接与第二票同意赛跑时要么开封要么交接，互斥且唯一；清除同刻赛跑时清除必胜） |
 | 操作留痕、重启一致 | 每次成功操作按自增序号追加 `audit_log`（含 `handover_invited/confirmed/revoked/expired`、`request_invalidated`）；WAL 持久化，重启时先跑一轮恢复扫描，状态、票数、审计顺序完全一致 |
 
 ### 请求状态机
@@ -42,14 +49,28 @@ waiting  ──(封存人替换投票见证人，有效票不足两票)───
 pending  ──(封存人在截止前撤销)─────────────────────────────▶ revoked
 pending  ──(过 deadline 仍不足两票)─────────────────────────▶ expired
 pending/waiting ──(受让人在交接邀请截止前确认交接)──────────▶ invalidated（旧同意删除）
+pending/waiting ──(资料到达清除时刻)─────────────────────────▶ invalidated（旧同意删除；资料置 purged）
+```
+
+### 资料与清除安排状态机
+
+```
+sealed ──(两票开封)──────────────────────────────▶ opened
+sealed/opened ──(到达 purge_at：清空正文)─────────▶ purged（终态，不可再开封/换人/交接）
+
+purge 安排：scheduled ──(到点清除)──▶ done
+              scheduled ──(到期前取消)─▶ cancelled（可重新安排）
 ```
 
 > 替换见证人不改变资料的 `sealed` 状态，只改变当前见证人名单，并按上表调整
 > 进行中请求的票数与状态；交接封存人也不改变资料状态，只把进行中的开封请求
-> 置为 `invalidated`（过截止时刻的仍为 `expired`）并转移封存人；`sealed/opened`
-> 是资料生命周期，`pending/waiting` 等是开封请求的状态，两者互不混淆。
+> 置为 `invalidated`（过截止时刻的仍为 `expired`）并转移封存人；到期清除把
+> 资料置为 `purged` 并清空正文（已开封资料同样），是终态。
+> `sealed/opened/purged` 是资料生命周期，`pending/waiting` 等是开封请求的状态，
+> `scheduled/done/cancelled` 是清除安排的状态，三者互不混淆。
 
-后台扫描器（默认每秒一次）在一轮内先把到点的 `waiting` 请求确定性开封，
+后台扫描器（默认每秒一次）在一轮内先把**已到清除时刻的安排确定性清除**
+（与最早开封同刻时清除优先，故排在最前），再把到点的 `waiting` 请求确定性开封，
 再把已到截止时刻仍 `pending` 的请求置为 `expired`，最后把过确认截止时刻仍
 `pending` 的交接邀请置为 `expired`；所有涉时刻判定在写事务内再做一次，杜绝临界时间竞态。
 
@@ -102,7 +123,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | GET | `/me` | 查询当前密钥对应的账号 |
 | POST | `/documents` | 封存资料：`{body, witnesses:[3人]}`，返回 `digest`（无正文） |
 | GET | `/documents` | 列出本人封存/见证的资料（仅元数据） |
-| GET | `/documents/{id}` | 详情；开封后才含 `body`、`reason`、`witness_approvals` |
+| GET | `/documents/{id}` | 详情；开封后才含 `body`、`reason`、`witness_approvals`；已清除只返回 `purged` 状态、`purged_at`、摘要与请求元数据（无正文），并含 `purge_schedule` |
 | POST | `/documents/{id}/open-requests` | 封存人提交开封请求：`{reason, deadline, earliest_open_at?}` |
 | POST | `/open-requests/{id}/approve` | 见证人同意：`{digest}`（须等于封存摘要）；第二票可能返回 `waiting` 或 `opened` |
 | POST | `/open-requests/{id}/revoke` | 封存人撤销：`{reason?}` |
@@ -111,18 +132,22 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | POST | `/handover-invitations/{id}/confirm` | 受让人在截止前凭本人密钥确认；返回新封存人与旧请求结果 |
 | POST | `/handover-invitations/{id}/revoke` | 封存人撤回待确认邀请 |
 | GET | `/handover-invitations/{id}` | 查询邀请状态（邀请双方或资料参与方可见，仅元数据） |
-| GET | `/documents/{id}/audit` | 按顺序返回该资料的全部操作记录 |
+| POST | `/documents/{id}/purge-schedules` | 封存人安排到期清除：`{purge_at}`（带时区、晚于当前）；已开封资料也可安排 |
+| POST | `/purge-schedules/{id}/reschedule` | 当前封存人到期前改期：`{purge_at}`（带时区、晚于当前） |
+| POST | `/purge-schedules/{id}/cancel` | 当前封存人到期前取消；取消后可重新安排 |
+| GET | `/documents/{id}/audit` | 按顺序返回该资料的全部操作记录（清除后仍保留） |
 
 状态码：成功 `200/201`；参数校验失败 `422`（如时间不带时区、`earliest_open_at`
 不早于 `deadline`）；业务校验失败 `400`（如三人不互异、截止时刻已过、最早开封时刻
 早于当前、替换时新见证人未注册或为封存人、交接受让人未注册/为本人/为见证人、
-确认截止时刻已过）；未认证 `401`；无权/不可见 `403`
-（含被替换掉的旧见证人再访问/再同意、交接后原封存人再访问、非受让人确认、
-非封存人撤回）；未找到 `404`（被替换者不在当前名单）；
+确认截止时刻已过、清除时刻不带时区或不在未来）；未认证 `401`；无权/不可见 `403`
+（含被替换掉的旧见证人再访问/再同意、交接后原封存人再访问、非当前封存人改期/取消
+清除安排、非受让人确认、非封存人撤回）；未找到 `404`（被替换者不在当前名单）；
 冲突（重复同意、重复开封、请求已撤销/到期、waiting 下再同意、已有进行中请求、
 新见证人已在名单、资料已开封仍替换、重复发起待确认交接邀请、确认已撤回/逾期/
-已确认的邀请、交接时资料已开封等）`409`。错误体统一为
-`{"detail": "..."}`，不含任何正文内容。
+已确认的邀请、交接时资料已开封、已有未到期清除安排、资料已清除后再开封/换人/
+交接/安排/改期/取消、清除安排已取消/已执行后再改期/取消、已过清除时刻后改期/
+取消等）`409`。错误体统一为 `{"detail": "..."}`，不含任何正文内容。
 
 ### 最早开封时刻（earliest_open_at）
 
@@ -308,6 +333,95 @@ curl -sS -X POST $BASE/handover-invitations/1/revoke -H "X-API-Key: $OWNER_KEY"
 #   重复发起待确认邀请 409；确认已撤回/逾期/已确认邀请 409；资料已开封 409。
 ```
 
+### 到期清除（scheduled purge）
+
+封存人可凭**现有密钥**为资料安排一个带时区的未来清除时刻；到期前可改期或
+取消。时刻到达后服务**确定性清除**——即使后台扫描器没有准时运行，之后的任何
+查询与操作也呈现已清除结果（扫描器、每个写事务、参与方查询进入临界区都会先
+做清除判定）。交接后清除安排随资料由**新封存人**管理，原封存人立即无权操作。
+
+- `POST /documents/{id}/purge-schedules`，请求体 `{"purge_at": "<带时区 ISO-8601 时刻>"}`；
+  `purge_at` 必须带时区且**晚于当前时间**；**已开封资料也可以安排**。每份资料同时
+  至多一份未到期（`scheduled`）安排，重复安排 `409`（请改期或先取消）。
+- 到期前当前封存人可：
+  - `POST /purge-schedules/{id}/reschedule`，请求体 `{"purge_at": "<新时刻>"}`，改期
+    （必须带时区且晚于当前；安排 id 不变，`updated_at` 更新）；
+  - `POST /purge-schedules/{id}/cancel` 取消（状态 `cancelled`），取消后可重新安排。
+- 只有资料的**当前封存人**可安排/改期/取消；见证人、原封存人（交接后）、无关账号
+  一律 `403`（不区分资料/安排是否存在）；无密钥 `401`。
+- **到点清除的结果**：
+  - 清空数据库业务记录中的正文（`documents.body` 置空），资料状态置为 `purged`，
+    回写清除时刻 `purged_at`，清除安排置为 `done`；
+  - **保留**：摘要 `digest`、封存人/见证人参与方名单、全部审计记录（新增一条
+    `purged` 留痕）；
+  - `GET /documents/{id}`、`GET /documents`（列表含 `purged_at`）、
+    `GET /documents/{id}/audit` 等任何接口**都不再返回 `body`**；详情返回
+    `status: "purged"`、`purged_at`、保留的 `digest` 与最近开封请求元数据。
+- **连带失效（未开封资料清除时）**：进行中（`pending`/`waiting`）的开封请求置
+  `invalidated` 并删除其全部旧同意（旧同意永久作废，不能用于之后）；待确认的
+  封存人交接邀请置 `expired`（不能再确认）。**已开封资料仍按期清除**，其开封
+  记录作为历史保留（`latest_open_request.status` 仍为 `opened`），但正文与
+  见证明细不再返回。
+- **清除与最早开封同刻**：清除优先。同刻到达的第二票同意不会抢先开封——同意
+  被拒（`409`）、请求随清除 `invalidated`，审计里只有 `purged` 没有 `opened`；
+  并发的交接确认同样被拒，身份不转移。若开封时刻更早，则先开封，之后到点按
+  “已开封资料”清除。全部判定在同一把 `BEGIN IMMEDIATE` 写锁内，只产生一个
+  已提交的一致结果。
+- **已清除即终态**：不能再开封（提交开封请求 `409`）、不能替换见证人（`409`）、
+  不能发起/确认/撤回交接（`409`）；旧安排不能改期/取消，也不能重复安排。
+- **拒绝不泄露正文**：无权 `403`、时间不带时区 `422`、清除时刻不在未来 `400`、
+  已到期或已取消后改期/取消 `409`，错误体统一 `{"detail": "..."}`，绝不含正文。
+  若资料恰好在改期/取消请求进入临界区时到点，清除先随事务提交，`409` 在提交后
+  返回（与“到点开封先落库”同理）。
+- 重启时先跑一轮恢复扫描，停机期间到点的清除在启动后（及第一次查询时）即呈现
+  已清除结果。
+
+安排/详情中的 `purge_schedule` 字段结构：
+
+```json
+{
+  "schedule_id": 3,
+  "document_id": 1,
+  "purge_at": "2027-01-01T00:00:00.000000+00:00",
+  "status": "scheduled",
+  "created_at": "2026-10-01T12:00:00.000000+00:00",
+  "updated_at": "2026-10-01T12:00:00.000000+00:00",
+  "resolved_at": null
+}
+```
+
+```bash
+# 安排到期清除（例如 30 天后，支持 +08:00 等带时区写法）
+PURGE=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(days=30)).isoformat())")
+curl -sS -X POST $BASE/documents/1/purge-schedules \
+  -H "X-API-Key: $OWNER_KEY" -H 'Content-Type: application/json' \
+  -d "{\"purge_at\":\"$PURGE\"}"
+# -> {"schedule_id":1,"document_id":1,"status":"scheduled","purge_at":"…","resolved_at":null}
+
+# 详情中的安排（未清除前查询仍无 body）
+curl -sS $BASE/documents/1 -H "X-API-Key: $OWNER_KEY"
+# -> {"status":"sealed", ..., "purge_schedule":{"schedule_id":1,"status":"scheduled",...}}
+
+# 到期前改期 / 取消
+NEWPURGE=$(python3 -c "import datetime;print((datetime.datetime.now(datetime.timezone.utc)+datetime.timedelta(days=60)).isoformat())")
+curl -sS -X POST $BASE/purge-schedules/1/reschedule \
+  -H "X-API-Key: $OWNER_KEY" -H 'Content-Type: application/json' \
+  -d "{\"purge_at\":\"$NEWPURGE\"}"
+# -> {"schedule_id":1,"status":"scheduled","purge_at":"…"}
+curl -sS -X POST $BASE/purge-schedules/1/cancel -H "X-API-Key: $OWNER_KEY"
+# -> {"schedule_id":1,"status":"cancelled",...}
+
+# 到点后查询（扫描器或本查询本身触发确定性清除）：
+curl -sS $BASE/documents/1 -H "X-API-Key: $OWNER_KEY"
+# -> {"status":"purged","purged_at":"…","digest":"ab12…",
+#     "witnesses":[...],"purge_schedule":{"status":"done","resolved_at":"…"},
+#     "latest_open_request":{"status":"invalidated",...}}   # 无 body
+
+# 拒绝示例（均不改状态、不泄露正文）：
+#   清除时刻已过/不带时区 400/422；非当前封存人（含交接后原封存人）403；
+#   重复安排、已清除后再安排/改期/取消/开封/换人/交接、已取消后再改期 409。
+```
+
 ### 调用示例（curl）
 
 ```bash
@@ -361,6 +475,7 @@ python3 examples/demo.py                 # 纯标准库 Python 版
 python3 examples/demo_scheduled.py       # 最早开封时刻：waiting -> 自动开封；补票立即开封
 python3 examples/demo_replace_witness.py # 见证人替换：直接换人 / 退票补票 / waiting 退回待同意
 python3 examples/demo_handover.py        # 封存人交接：邀请/撤回/逾期/确认失效旧请求/转移身份/开封后邀请失效
+python3 examples/demo_purge.py           # 到期清除：安排/改期/取消、到点清空正文、请求与邀请连带失效、开封后仍清除、交接后新封存人管理、同刻清除优先
 ```
 
 ### 典型拒绝场景
@@ -396,7 +511,16 @@ python -m pytest -q
 清零、过截止旧请求按原规则 `expired`、`waiting` 请求随交接失效且不开封、到点两票
 已齐先开封并拒绝交接、资料开封连带邀请失效、交接结果冷读库一致，以及真实 uvicorn +
 多线程的**并发确认 vs 撤回、并发确认 vs 第二票同意赛跑**（两种终态互斥且唯一，
-成功交接与请求失效均留审计）。
+成功交接与请求失效均留审计）；
+另含到期清除：安排校验（带时区、晚于当前、仅封存人、唯一未到期安排）、改期/取消
+与已取消/已到期拒绝、交接后新封存人管理而原封存人 403、到点清空正文且保留摘要/
+参与方/审计（任何接口不再返回正文、库内正文确为空串）、未开封资料清除时进行中
+请求 `invalidated` 且旧同意清零、待确认邀请失效、已开封资料仍按期清除、清除不
+依赖扫描器准时（查询即触发）、清除与最早开封同刻清除优先（waiting 同刻与第二票
+同刻均不开封）、开封更早先开封再清除、已清除后一切开封/换人/交接/改期/取消/重复
+安排均拒绝且错误体无正文、停机期间到点的重启恢复，以及真实 uvicorn + 多线程的
+**并发清除 vs 第二票同意/交接确认赛跑**（清除必胜、身份不转移、从未开封、只留一条
+`purged` 审计）和旧版库（`documents`/`open_requests` 旧 CHECK）幂等迁移。
 
 ## 项目结构
 
@@ -404,12 +528,12 @@ python -m pytest -q
 app/
   config.py     # 环境变量配置
   db.py         # SQLite 连接、建表与旧库幂等迁移、BEGIN IMMEDIATE 写事务、时间规范
-  schemas.py    # 请求模型（含带时区 deadline / earliest_open_at、替换见证人、交接邀请入参校验）
-  main.py       # FastAPI 路由、认证、定时开封+到期扫描器、全部业务规则（见证人替换、封存人交接）
+  schemas.py    # 请求模型（含带时区 deadline / earliest_open_at、替换见证人、交接邀请、到期清除入参校验）
+  main.py       # FastAPI 路由、认证、定时开封+到期清除+到期扫描器、全部业务规则（见证人替换、封存人交接、到期清除）
 init_db.py      # 幂等初始化入口
 entrypoint.sh   # 容器入口（初始化 + uvicorn）
-examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace_witness.py / demo_handover.py 端到端示例
-tests/          # pytest 测试（功能、定时、替换见证人、交接、并发、重启）
+examples/       # demo.sh / demo.py / demo_scheduled.py / demo_replace_witness.py / demo_handover.py / demo_purge.py 端到端示例
+tests/          # pytest 测试（功能、定时、替换见证人、交接、到期清除、并发、重启）
 Dockerfile
 docker-compose.yml
 ```
