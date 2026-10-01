@@ -28,8 +28,17 @@
 - 交接邀请的发起/撤回/确认与开封请求的同意/撤销/替换/定时处理共用同一把
   写锁，全部按 BEGIN IMMEDIATE 已提交顺序产生唯一结果；成功交接与请求失效
   均追加审计；后台扫描器同时处理开封请求到期与交接邀请逾期；
+- 封存人可为资料安排带时区的未来清除时刻（到期清除正文），到期前可改期或
+  取消；交接后清除安排保留并改由新封存人管理，原封存人无权操作；
+- 到期时无论扫描器是否准时运行，后续查询与操作都呈现已清除结果：扫描器、
+  每个写事务与资料查询都会先做确定性到点清除判定——清空正文（body），
+  状态置 purged，保留摘要、参与方与审计元数据，任何接口不再返回正文；
+  已开封资料仍按期清除；未开封资料的进行中开封请求失效（旧同意作废）、
+  待确认交接邀请失效；清除与最早开封同刻时清除优先，开封更早则先开封；
+  已清除资料不能再开封、替换见证人、交接或再安排清除；已到期的改期或取消
+  一律拒绝且不泄露正文；
 - 所有“检查 + 写入”都在 BEGIN IMMEDIATE 短事务内完成，并发同意/撤销/定时开封/
-  到期/替换见证人只有一个已提交结果；
+  到期/替换见证人/交接确认/到期清除只有一个已提交结果；
 - 每次操作按顺序追加到 audit_log，SQLite 持久化，重启后状态一致。
 """
 import asyncio
@@ -51,6 +60,7 @@ from .schemas import (
     ApproveIn,
     HandoverIn,
     OpenRequestIn,
+    PurgeIn,
     RegisterIn,
     ReplaceWitnessIn,
     RevokeIn,
@@ -162,22 +172,186 @@ def resolve_due_waiting(tx: sqlite3.Connection, now: str, request_id: int | None
 
     所有写路径（同意/撤销/新建请求/后台扫描）进入临界区后都先调用本函数，
     保证“到点必开封”不依赖后台扫描器的及时性。返回本次开封条数。
+
+    清除优先：资料已安排清除时刻且 purge_at <= earliest_open_at（清除更早
+    或与最早开封同刻）时，请求不在此处开封，交由 purge_due_documents 直接
+    清除（资料 purged、请求 invalidated）；只有 purge_at 严格晚于
+    earliest_open_at（开封更早）的请求才在此处先开封。
     """
+    # 清除优先条件：d.purge_at IS NULL OR d.purge_at > r.earliest_open_at 才开封
     if request_id is not None:
         rows = tx.execute(
-            "SELECT id, document_id FROM open_requests"
-            " WHERE id = ? AND status = 'waiting' AND earliest_open_at <= ?",
+            "SELECT r.id, r.document_id FROM open_requests r"
+            " JOIN documents d ON d.id = r.document_id"
+            " WHERE r.id = ? AND r.status = 'waiting' AND r.earliest_open_at <= ?"
+            " AND (d.purge_at IS NULL OR d.purge_at > r.earliest_open_at)",
             (request_id, now),
         ).fetchall()
     else:
         rows = tx.execute(
-            "SELECT id, document_id FROM open_requests"
-            " WHERE status = 'waiting' AND earliest_open_at <= ?",
+            "SELECT r.id, r.document_id FROM open_requests r"
+            " JOIN documents d ON d.id = r.document_id"
+            " WHERE r.status = 'waiting' AND r.earliest_open_at <= ?"
+            " AND (d.purge_at IS NULL OR d.purge_at > r.earliest_open_at)",
             (now,),
         ).fetchall()
     for row in rows:
         open_request_now(tx, req_id=row["id"], doc_id=row["document_id"], now=now)
     return len(rows)
+
+
+# ---------------------------------------------------------------------------
+# 到期清除正文（scheduled purge）
+#
+# 封存人可为资料安排带时区的未来清除时刻；到期后无论扫描器是否准时运行，
+# 后续查询与操作都必须呈现已清除结果：扫描器、每个写事务与资料查询都会先
+# 做确定性到点清除判定。清除生效时：清空正文（body 置空）、状态置 purged、
+# purged_at 记为约定的清除时刻；摘要、参与方与审计元数据全部保留；未开封
+# 资料的进行中开封请求失效（旧同意删除）、待确认交接邀请失效；已开封资料
+# 同样按期清除。清除与最早开封同刻时清除优先，开封更早则先开封再清除。
+# ---------------------------------------------------------------------------
+
+
+def purge_document_now(
+    tx: sqlite3.Connection,
+    *,
+    doc_id: int,
+    now: str,
+    actor_id: int | None = None,
+) -> None:
+    """在已持有的写事务内清除一份到点资料的正文并追加审计。
+
+    结算顺序：先把“最早开封时刻严格早于清除时刻”的待开封请求补开
+    （开封更早则先开封；读路径直接调用本函数时也能得到一致历史），
+    再把仍进行中的开封请求失效并删除旧同意、使待确认交接邀请失效，
+    最后清空正文、置 purged。清除与最早开封同刻时清除优先（不开封）。
+    """
+    doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+    purge_at = doc["purge_at"]
+
+    # 开封时刻严格更早的 waiting 请求先开封（同刻不清除优先 -> 不在这里开）。
+    # 写路径中 resolve_due_waiting 已处理过这些请求，此处是读路径/兜底补齐。
+    earlier = tx.execute(
+        "SELECT id FROM open_requests"
+        " WHERE document_id = ? AND status = 'waiting' AND earliest_open_at < ?",
+        (doc_id, purge_at),
+    ).fetchall()
+    for row in earlier:
+        open_request_now(tx, req_id=row["id"], doc_id=doc_id, now=now)
+
+    # 仍进行中的开封请求失效（过截止时刻的按原规则 expired），旧同意删除。
+    active = tx.execute(
+        "SELECT * FROM open_requests"
+        " WHERE document_id = ? AND status IN ('pending', 'waiting')"
+        " ORDER BY id DESC LIMIT 1",
+        (doc_id,),
+    ).fetchone()
+    if active is not None:
+        if active["status"] == "pending" and active["deadline"] <= now:
+            tx.execute(
+                "UPDATE open_requests SET status='expired', resolved_at=? WHERE id=?",
+                (now, active["id"]),
+            )
+            add_audit(
+                tx,
+                actor_id=None,
+                action="request_expired",
+                document_id=doc_id,
+                request_id=active["id"],
+                detail="清除时刻到达时开封请求已过截止时刻，请求按原规则失效，已有同意作废",
+            )
+        else:
+            tx.execute(
+                "UPDATE open_requests SET status='invalidated', resolved_at=? WHERE id=?",
+                (now, active["id"]),
+            )
+            add_audit(
+                tx,
+                actor_id=None,
+                action="request_invalidated",
+                document_id=doc_id,
+                request_id=active["id"],
+                detail="资料已到清除时刻，进行中的开封请求失效，其全部旧同意作废",
+            )
+        tx.execute("DELETE FROM approvals WHERE request_id = ?", (active["id"],))
+
+    # 待确认的封存人交接邀请随清除失效。
+    invalidate_pending_invitations(
+        tx,
+        doc_id=doc_id,
+        now=now,
+        detail="资料已到清除时刻，待确认的封存人交接邀请失效",
+    )
+
+    # 清空正文、置 purged；purged_at 记为约定的清除时刻，与扫描及时性无关。
+    # 摘要、参与方（封存人/见证人）与审计元数据全部保留。
+    tx.execute(
+        "UPDATE documents SET status='purged', body='', purged_at=?"
+        " WHERE id=? AND status IN ('sealed', 'opened')",
+        (purge_at, doc_id),
+    )
+    add_audit(
+        tx,
+        actor_id=actor_id,
+        action="purged",
+        document_id=doc_id,
+        detail=(
+            f"已到清除时刻 {purge_at}，资料正文已清除；"
+            "摘要、参与方与审计元数据保留，任何接口不再返回正文"
+        ),
+    )
+
+
+def purge_due_documents(
+    tx: sqlite3.Connection, now: str, document_id: int | None = None
+) -> int:
+    """在已持有的写事务内把已到清除时刻的资料确定性清除。返回本次清除份数。
+
+    与到点开封同理：扫描器、每个写事务与资料查询都先做本判定，
+    “到期必清除”不依赖后台扫描器的及时性。
+    """
+    if document_id is not None:
+        rows = tx.execute(
+            "SELECT id FROM documents"
+            " WHERE id = ? AND purge_at IS NOT NULL AND purge_at <= ?"
+            " AND status != 'purged'",
+            (document_id, now),
+        ).fetchall()
+    else:
+        rows = tx.execute(
+            "SELECT id FROM documents"
+            " WHERE purge_at IS NOT NULL AND purge_at <= ? AND status != 'purged'",
+            (now,),
+        ).fetchall()
+    for row in rows:
+        purge_document_now(tx, doc_id=row["id"], now=now)
+    return len(rows)
+
+
+def settle_due_purges_for_read(db: sqlite3.Connection, document_id: int | None = None) -> None:
+    """读路径的确定性到点清除：仅当存在到点未清除的资料时才进入写事务。
+
+    保证“到期后查询也呈现已清除结果”，同时不改变未清除资料的只读行为。
+    """
+    now = utc_str(now_utc())
+    if document_id is not None:
+        due = db.execute(
+            "SELECT 1 FROM documents"
+            " WHERE id = ? AND purge_at IS NOT NULL AND purge_at <= ?"
+            " AND status != 'purged'",
+            (document_id, now),
+        ).fetchone()
+    else:
+        due = db.execute(
+            "SELECT 1 FROM documents"
+            " WHERE purge_at IS NOT NULL AND purge_at <= ? AND status != 'purged'"
+            " LIMIT 1",
+            (now,),
+        ).fetchone()
+    if due is None:
+        return
+    with write_tx(db) as tx:
+        purge_due_documents(tx, utc_str(now_utc()), document_id)
 
 
 def expire_due_invitations(tx: sqlite3.Connection, now: str, invitation_id: int | None = None) -> int:
@@ -243,7 +417,8 @@ class ExpirySweeper:
 
     @staticmethod
     def sweep_once() -> int:
-        """一轮定时处理：先把到点的 waiting 请求开封，再把过截止时刻仍
+        """一轮定时处理：先把到点的 waiting 请求开封（清除优先的不开），
+        再把到清除时刻的资料清除正文，然后把过截止时刻仍
         pending（票数不足）的请求置为 expired，最后把过确认截止时刻仍
         pending 的交接邀请置为 expired；返回失效（expired）请求条数。"""
         conn = connect()
@@ -253,7 +428,10 @@ class ExpirySweeper:
                 # 第一步：到点开封。waiting 必然满足 earliest_open_at < deadline，
                 # 到点即生效，永远不会走到下面的过期分支。
                 resolve_due_waiting(tx, now)
-                # 第二步：到截止时刻仍未集齐两票（pending）的请求失效。
+                # 第二步：到清除时刻的资料清空正文（purged）；其进行中请求、
+                # 旧同意与待确认交接邀请在 purge_document_now 内一并结算。
+                purge_due_documents(tx, now)
+                # 第三步：到截止时刻仍未集齐两票（pending）的请求失效。
                 rows = tx.execute(
                     "SELECT id, document_id FROM open_requests"
                     " WHERE status = 'pending' AND deadline <= ?",
@@ -272,7 +450,7 @@ class ExpirySweeper:
                         request_id=row["id"],
                         detail="开封请求到期前未取得两名不同见证人同意，请求失效，已有同意作废",
                     )
-                # 第三步：过确认截止时刻仍待确认的交接邀请失效（逾期后可重新邀请）。
+                # 第四步：过确认截止时刻仍待确认的交接邀请失效（逾期后可重新邀请）。
                 expire_due_invitations(tx, now)
                 return len(rows)
         finally:
@@ -293,7 +471,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="双人见证资料封存服务",
-    version="1.4.0",
+    version="1.5.0",
     lifespan=lifespan,
 )
 
@@ -453,10 +631,14 @@ def list_documents(
     db: sqlite3.Connection = Depends(get_db),
     user: sqlite3.Row = Depends(current_user),
 ) -> dict[str, Any]:
-    """仅列出本人封存或本人见证的资料（只有元数据，永不返回正文）。"""
+    """仅列出本人封存或本人见证的资料（只有元数据，永不返回正文）。
+
+    到清除时刻的资料在查询前被确定性清除（purged），列表呈现已清除状态。
+    """
+    settle_due_purges_for_read(db)
     rows = db.execute(
         """
-        SELECT DISTINCT d.id, d.status, d.created_at, d.opened_at
+        SELECT DISTINCT d.id, d.status, d.created_at, d.opened_at, d.purge_at, d.purged_at
         FROM documents d
         LEFT JOIN document_witnesses w ON w.document_id = d.id
         WHERE d.owner_id = ? OR w.user_id = ?
@@ -467,13 +649,31 @@ def list_documents(
     return {"documents": [dict(row) for row in rows]}
 
 
+def _open_request_meta(req: sqlite3.Row) -> dict[str, Any]:
+    """开封请求的元数据视图（不含正文、不含投票人）。"""
+    return {
+        "request_id": req["id"],
+        "reason": req["reason"],
+        "deadline": req["deadline"],
+        "earliest_open_at": req["earliest_open_at"],
+        "status": req["status"],
+        "created_at": req["created_at"],
+        "resolved_at": req["resolved_at"],
+    }
+
+
 @app.get("/documents/{doc_id}")
 def get_document(
     doc_id: int,
     db: sqlite3.Connection = Depends(get_db),
     user: sqlite3.Row = Depends(current_user),
 ) -> dict[str, Any]:
-    """查询资料。开封前不含正文；开封后返回正文、摘要、理由与见证记录。只读，不改状态。"""
+    """查询资料。开封前不含正文；开封后返回正文、摘要、理由与见证记录。
+
+    已到清除时刻的资料先被确定性清除：返回 purged 状态与清除时刻，
+    保留摘要、参与方与审计元数据，正文永不返回。除此之外只读，不改状态。
+    """
+    settle_due_purges_for_read(db, doc_id)
     doc = load_doc_for_participant(db, doc_id, user)
 
     witnesses = [
@@ -502,16 +702,25 @@ def get_document(
         result["body"] = doc["body"]            # 开封后才返回正文
         result["digest"] = doc["digest"]
         result["opened_at"] = doc["opened_at"]
+        result["purge_at"] = doc["purge_at"]    # 已安排的清除时刻（可能为 null）
         if latest is not None:
-            result["open_request"] = {
-                "request_id": latest["id"],
-                "reason": latest["reason"],
-                "deadline": latest["deadline"],
-                "earliest_open_at": latest["earliest_open_at"],
-                "status": latest["status"],
-                "created_at": latest["created_at"],
-                "resolved_at": latest["resolved_at"],
-            }
+            result["open_request"] = _open_request_meta(latest)
+            witness_records = db.execute(
+                """SELECT u.username, a.bound_digest, a.created_at AS approved_at
+                   FROM approvals a JOIN users u ON u.id = a.witness_id
+                   WHERE a.request_id = ? ORDER BY a.id""",
+                (latest["id"],),
+            ).fetchall()
+            result["witness_approvals"] = [dict(row) for row in witness_records]
+    elif doc["status"] == "purged":
+        # 已清除：保留摘要、参与方与审计元数据；任何接口不再返回正文
+        result["digest"] = doc["digest"]
+        result["purge_at"] = doc["purge_at"]
+        result["purged_at"] = doc["purged_at"]
+        if doc["opened_at"] is not None:
+            result["opened_at"] = doc["opened_at"]
+        if latest is not None:
+            result["open_request"] = _open_request_meta(latest)
             witness_records = db.execute(
                 """SELECT u.username, a.bound_digest, a.created_at AS approved_at
                    FROM approvals a JOIN users u ON u.id = a.witness_id
@@ -521,6 +730,7 @@ def get_document(
             result["witness_approvals"] = [dict(row) for row in witness_records]
     else:
         # 开封前：只给当前开封请求的元数据，不给正文，也不给谁已同意
+        result["purge_at"] = doc["purge_at"]    # 已安排的清除时刻（可能为 null）
         if latest is not None:
             result["latest_open_request"] = {
                 "request_id": latest["id"],
@@ -561,13 +771,19 @@ def create_open_request(
     if earliest is not None and earliest < now:
         raise err(400, "最早开封时刻不能早于当前时间")
 
+    # 清除若在本临界区内生效，清除先落库，拒绝在提交后再返回（与同意/撤销一致）
+    post_commit_error: HTTPException | None = None
+    request_id: int | None = None
     with write_tx(db) as tx:
-        # 锁内先处理到点的定时开封，避免与同意/撤销/扫描并发
+        # 锁内先处理到点的定时开封与到期清除，避免与同意/撤销/扫描并发
         resolve_due_waiting(tx, now)
+        purge_due_documents(tx, now)
         doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
-        if doc["status"] != "sealed":
+        if doc["status"] == "purged":
+            post_commit_error = err(409, "资料已清除，不能提交开封请求")
+        elif doc["status"] != "sealed":
             raise err(409, "资料已开封，重复开封被拒绝")
-        active = tx.execute(
+        active = None if post_commit_error else tx.execute(
             "SELECT id, deadline FROM open_requests"
             " WHERE document_id = ? AND status IN ('pending', 'waiting')",
             (doc_id,),
@@ -590,22 +806,26 @@ def create_open_request(
             else:
                 raise err(409, "已有进行中的开封请求，请先撤销或等待其到期")
 
-        cur = tx.execute(
-            "INSERT INTO open_requests (document_id, reason, deadline, status, created_at, earliest_open_at)"
-            " VALUES (?, ?, ?, 'pending', ?, ?)",
-            (doc_id, payload.reason, deadline, now, earliest),
-        )
-        request_id = cur.lastrowid
-        timing = f"最早开封时刻: {earliest}" if earliest else "未指定最早开封时刻，两票集齐即开封"
-        add_audit(
-            tx,
-            actor_id=user["id"],
-            action="open_request_created",
-            document_id=doc_id,
-            request_id=request_id,
-            detail=f"提交开封请求，理由: {payload.reason}；截止时刻: {deadline}；{timing}",
-        )
+        if post_commit_error is None:
+            cur = tx.execute(
+                "INSERT INTO open_requests (document_id, reason, deadline, status, created_at, earliest_open_at)"
+                " VALUES (?, ?, ?, 'pending', ?, ?)",
+                (doc_id, payload.reason, deadline, now, earliest),
+            )
+            request_id = cur.lastrowid
+            timing = f"最早开封时刻: {earliest}" if earliest else "未指定最早开封时刻，两票集齐即开封"
+            add_audit(
+                tx,
+                actor_id=user["id"],
+                action="open_request_created",
+                document_id=doc_id,
+                request_id=request_id,
+                detail=f"提交开封请求，理由: {payload.reason}；截止时刻: {deadline}；{timing}",
+            )
 
+    if post_commit_error is not None:
+        raise post_commit_error
+    assert request_id is not None
     return {
         "request_id": request_id,
         "document_id": doc_id,
@@ -644,15 +864,17 @@ def approve_open_request(
         raise err(403, "只有指定见证人可以同意")
 
     now = utc_str(now_utc())
-    # 到点开封必须先落库：若本请求因此开封而本次同意仍需拒绝，要等事务提交后再抛错，
-    # 绝不能让回滚把已经生效的开封撤销。
+    # 到点开封/到期清除必须先落库：若本请求因此开封（或资料因此清除）而本次
+    # 同意仍需拒绝，要等事务提交后再抛错，绝不能让回滚把已经生效的判定撤销。
     post_commit_error: HTTPException | None = None
     response: dict[str, Any] | None = None
     try:
         with write_tx(db) as tx:
-            # 临界区第一步：到点的 waiting 请求必开封；之后任何状态判定都以开封为准，
-            # 因此定时开封即使被后台延迟处理，也不会被并发同意/撤销/扫描作废。
+            # 临界区第一步：到点的 waiting 请求必开封、到清除时刻的资料必清除；
+            # 之后任何状态判定都以此为准，因此定时处理即使被后台延迟，
+            # 也不会被并发同意/撤销/扫描作废。
             due_opened = resolve_due_waiting(tx, now, request_id) > 0
+            purged_here = purge_due_documents(tx, now, meta["document_id"]) > 0
             req = tx.execute(
                 "SELECT * FROM open_requests WHERE id = ?", (request_id,)
             ).fetchone()
@@ -661,10 +883,14 @@ def approve_open_request(
             ).fetchone()
 
             if doc["status"] != "sealed":
-                if due_opened:
-                    post_commit_error = err(409, "资料已开封，重复开封被拒绝")
+                if doc["status"] == "purged":
+                    not_sealed = err(409, "资料已清除，同意被拒绝")
                 else:
-                    raise err(409, "资料已开封，重复开封被拒绝")
+                    not_sealed = err(409, "资料已开封，重复开封被拒绝")
+                if due_opened or purged_here:
+                    post_commit_error = not_sealed
+                else:
+                    raise not_sealed
             elif req["status"] == "waiting":
                 raise err(409, "两票已集齐，待到达最早开封时刻自动开封，同意被拒绝")
             elif req["status"] != "pending":
@@ -776,17 +1002,23 @@ def revoke_open_request(
         raise err(403, "只有封存人可以撤销开封请求")
 
     now = utc_str(now_utc())
-    # 与同意相同：到点开封先提交，拒绝（撤销已随开封失效的请求）在提交后再返回。
+    # 与同意相同：到点开封/到期清除先提交，拒绝（撤销已随开封/清除失效的请求）
+    # 在提交后再返回。
     post_commit_error: HTTPException | None = None
     with write_tx(db) as tx:
         due_opened = resolve_due_waiting(tx, now, request_id) > 0
+        purged_here = purge_due_documents(tx, now, meta["document_id"]) > 0
         req = tx.execute("SELECT * FROM open_requests WHERE id = ?", (request_id,)).fetchone()
         doc = tx.execute("SELECT * FROM documents WHERE id = ?", (req["document_id"],)).fetchone()
         if doc["status"] != "sealed":
-            if due_opened:
-                post_commit_error = err(409, "资料已开封，无法撤销")
+            if doc["status"] == "purged":
+                not_sealed = err(409, "资料已清除，无法撤销")
             else:
-                raise err(409, "资料已开封，无法撤销")
+                not_sealed = err(409, "资料已开封，无法撤销")
+            if due_opened or purged_here:
+                post_commit_error = not_sealed
+            else:
+                raise not_sealed
         elif req["status"] not in ("pending", "waiting"):
             raise err(409, f"开封请求当前状态为 {req['status']}，无法撤销")
         elif req["deadline"] <= now:
@@ -837,15 +1069,20 @@ def replace_witness(
     post_commit_error: HTTPException | None = None
     result: dict[str, Any] = {}
     with write_tx(db) as tx:
-        # 临界区第一步与其他写路径一致：先确定性到点开封。
-        # 用全局解析：与扫描器等价，顺带把已到点的 waiting 请求开封。
+        # 临界区第一步与其他写路径一致：先确定性到点开封与到期清除。
+        # 用全局解析：与扫描器等价，顺带把已到点的 waiting 请求开封、
+        # 到清除时刻的资料清除。
         resolve_due_waiting(tx, now)
+        purge_due_documents(tx, now)
         doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
         if doc["status"] != "sealed":
-            # 资料已开封即不允许替换：无论开封是本临界区刚触发的到点开封，
-            # 还是并发的第二票同意在更早的事务里完成的，结论一致。
-            # 若为前者，开封必须先随本事务提交，故错误延迟到提交后再抛出。
-            post_commit_error = err(409, "资料已开封，无法替换见证人")
+            # 资料已开封/已清除即不允许替换：无论状态变更是本临界区刚触发的
+            # 到点判定，还是并发事务在更早时完成的，结论一致。
+            # 若为前者，变更必须先随本事务提交，故错误延迟到提交后再抛出。
+            if doc["status"] == "purged":
+                post_commit_error = err(409, "资料已清除，无法替换见证人")
+            else:
+                post_commit_error = err(409, "资料已开封，无法替换见证人")
         else:
             old_row = tx.execute(
                 """SELECT w.id, w.user_id, u.username FROM document_witnesses w
@@ -1049,15 +1286,19 @@ def create_handover_invitation(
     invitation: dict[str, Any] | None = None
     try:
         with write_tx(db) as tx:
-            # 临界区第一步与其他写路径一致：先确定性到点开封（开封会连带使
-            # 既有待确认邀请失效，必须先落库）。
+            # 临界区第一步与其他写路径一致：先确定性到点开封与到期清除
+            # （开封/清除会连带使既有待确认邀请失效，必须先落库）。
             resolve_due_waiting(tx, now)
+            purge_due_documents(tx, now)
             expire_due_invitations(tx, now)
 
             doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
             if doc["status"] != "sealed":
-                # 开封若为本临界区刚触发，必须先提交，错误延迟到提交后抛出。
-                post_commit_error = err(409, "资料已开封，不能发起交接")
+                # 开封/清除若为本临界区刚触发，必须先提交，错误延迟到提交后抛出。
+                if doc["status"] == "purged":
+                    post_commit_error = err(409, "资料已清除，不能发起交接")
+                else:
+                    post_commit_error = err(409, "资料已开封，不能发起交接")
             else:
                 if doc["owner_id"] != user["id"]:
                     raise err(403, "只有封存人可以发起交接")
@@ -1141,12 +1382,13 @@ def revoke_handover_invitation(
     _load_invitation_for_owner(db, invitation_id, user)
 
     now = utc_str(now_utc())
-    # 与同意/撤销开封请求相同：若开封在本临界区内被确定性触发，开封先提交，
-    # 撤回失败在提交后再返回。
+    # 与同意/撤销开封请求相同：若开封/清除在本临界区内被确定性触发，
+    # 状态变更先提交，撤回失败在提交后再返回。
     post_commit_error: HTTPException | None = None
     invitation: dict[str, Any] | None = None
     with write_tx(db) as tx:
         resolve_due_waiting(tx, now)
+        purge_due_documents(tx, now)
         expired_here = expire_due_invitations(tx, now, invitation_id) > 0
 
         inv = tx.execute(
@@ -1158,7 +1400,10 @@ def revoke_handover_invitation(
         if doc["owner_id"] != user["id"] or inv["from_user_id"] != user["id"]:
             raise err(403, "只有发起交接的封存人可以撤回该邀请")
         if doc["status"] != "sealed":
-            post_commit_error = err(409, "资料已开封，邀请已失效，无法撤回")
+            if doc["status"] == "purged":
+                post_commit_error = err(409, "资料已清除，邀请已失效，无法撤回")
+            else:
+                post_commit_error = err(409, "资料已开封，邀请已失效，无法撤回")
         elif expired_here or inv["status"] == "expired":
             post_commit_error = err(409, "交接邀请已逾期，不能撤回（可重新邀请）")
         elif inv["status"] == "confirmed":
@@ -1211,8 +1456,9 @@ def confirm_handover(
     post_commit_error: HTTPException | None = None
     response: dict[str, Any] | None = None
     with write_tx(db) as tx:
-        # 结算顺序第 1 步：到点开封 / 邀请逾期全部确定性落库。
+        # 结算顺序第 1 步：到点开封 / 到期清除 / 邀请逾期全部确定性落库。
         resolve_due_waiting(tx, now)
+        purge_due_documents(tx, now)
         expire_due_invitations(tx, now)
 
         inv = tx.execute(
@@ -1249,9 +1495,12 @@ def confirm_handover(
         if inv["to_user_id"] != user["id"]:
             raise err(403, "只有受让人本人可以确认交接")
         if doc["status"] != "sealed":
-            # 开封（含本临界区刚触发的到点开封）后拒绝交接；到点开封必须先随
+            # 开封/清除（含本临界区刚触发的到点判定）后拒绝交接；状态变更必须先随
             # 本事务提交，故错误延迟到提交后再返回（与同意/替换路径一致）。
-            post_commit_error = err(409, "资料已开封，交接被拒绝")
+            if doc["status"] == "purged":
+                post_commit_error = err(409, "资料已清除，交接被拒绝")
+            else:
+                post_commit_error = err(409, "资料已开封，交接被拒绝")
         elif inv["status"] == "expired":
             # 本临界区刚判定逾期也要先提交，故延迟到提交后再报错
             post_commit_error = err(409, "交接邀请已逾期，不能确认（请封存人重新邀请）")
@@ -1360,12 +1609,19 @@ def get_handover_invitation(
     db: sqlite3.Connection = Depends(get_db),
     user: sqlite3.Row = Depends(current_user),
 ) -> dict[str, Any]:
-    """查询邀请状态：邀请双方或该资料当前参与方（封存人/见证人）可见；只含元数据。"""
+    """查询邀请状态：邀请双方或该资料当前参与方（封存人/见证人）可见；只含元数据。
+
+    资料到清除时刻的，先确定性清除（待确认邀请随之失效），再返回最新状态。
+    """
     inv = db.execute(
         "SELECT * FROM handover_invitations WHERE id = ?", (invitation_id,)
     ).fetchone()
     if inv is None:
         raise err(403, "无权操作该邀请或邀请不存在")
+    settle_due_purges_for_read(db, inv["document_id"])
+    inv = db.execute(
+        "SELECT * FROM handover_invitations WHERE id = ?", (invitation_id,)
+    ).fetchone()
     is_party = user["id"] in (inv["from_user_id"], inv["to_user_id"])
     is_participant = False
     doc = db.execute(
@@ -1385,6 +1641,124 @@ def get_handover_invitation(
 
 
 # ---------------------------------------------------------------------------
+# 到期清除正文（资料封存人专享）
+#
+# 封存人凭本人密钥为资料安排带时区的未来清除时刻；到期前可改期（再次 PUT）
+# 或取消（DELETE）。交接后清除安排保留，改由新封存人管理（原封存人 403）。
+# 到点判定与开封/交接共用同一把写锁：清除若在本临界区内生效，清除先落库，
+# 改期/取消的拒绝在提交后再返回；已到期的改期或取消一律 409，且不泄露正文。
+# ---------------------------------------------------------------------------
+
+
+@app.put("/documents/{doc_id}/purge")
+def schedule_purge(
+    doc_id: int,
+    payload: PurgeIn,
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    """安排或改期到期清除时刻。已开封资料同样可安排（到点照常清除正文）。"""
+    doc = load_doc_for_participant(db, doc_id, user)
+    if doc["owner_id"] != user["id"]:
+        raise err(403, "只有封存人可以安排到期清除")
+
+    purge_at = utc_str(payload.purge_at)
+    now = utc_str(now_utc())
+    if purge_at <= now:
+        raise err(400, "清除时刻必须晚于当前时间")
+
+    post_commit_error: HTTPException | None = None
+    result: dict[str, Any] | None = None
+    with write_tx(db) as tx:
+        # 临界区第一步与其他写路径一致：先确定性到点开封与到期清除。
+        # 清除时刻已到的资料在此生效（purged），随后的改期请求随即被拒。
+        resolve_due_waiting(tx, now)
+        purge_due_documents(tx, now)
+
+        doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        if doc["status"] == "purged":
+            # 清除可能刚在本临界区生效：必须先提交，错误延迟到提交后抛出
+            post_commit_error = err(409, "资料已清除，不能再安排或改期清除")
+        else:
+            previous = doc["purge_at"]
+            tx.execute(
+                "UPDATE documents SET purge_at = ? WHERE id = ?",
+                (purge_at, doc_id),
+            )
+            if previous is None:
+                add_audit(
+                    tx,
+                    actor_id=user["id"],
+                    action="purge_scheduled",
+                    document_id=doc_id,
+                    detail=f"封存人安排到期清除，清除时刻: {purge_at}",
+                )
+            else:
+                add_audit(
+                    tx,
+                    actor_id=user["id"],
+                    action="purge_rescheduled",
+                    document_id=doc_id,
+                    detail=f"封存人改期到期清除：{previous} -> {purge_at}",
+                )
+            result = {
+                "document_id": doc_id,
+                "status": doc["status"],
+                "purge_at": purge_at,
+                "previous_purge_at": previous,
+            }
+    if post_commit_error is not None:
+        raise post_commit_error
+    assert result is not None
+    return result
+
+
+@app.delete("/documents/{doc_id}/purge")
+def cancel_purge(
+    doc_id: int,
+    db: sqlite3.Connection = Depends(get_db),
+    user: sqlite3.Row = Depends(current_user),
+) -> dict[str, Any]:
+    """在清除时刻到来前取消已安排的到期清除。"""
+    doc = load_doc_for_participant(db, doc_id, user)
+    if doc["owner_id"] != user["id"]:
+        raise err(403, "只有封存人可以取消到期清除")
+
+    now = utc_str(now_utc())
+    post_commit_error: HTTPException | None = None
+    result: dict[str, Any] | None = None
+    with write_tx(db) as tx:
+        # 与改期相同：先确定性到点开封与到期清除；清除时刻已到的资料在此
+        # 生效，取消请求随即被拒（已到期不能取消）。
+        resolve_due_waiting(tx, now)
+        purge_due_documents(tx, now)
+
+        doc = tx.execute("SELECT * FROM documents WHERE id = ?", (doc_id,)).fetchone()
+        if doc["status"] == "purged":
+            post_commit_error = err(409, "资料已清除，不能取消清除")
+        elif doc["purge_at"] is None:
+            raise err(409, "当前没有已安排的清除时刻")
+        else:
+            previous = doc["purge_at"]
+            tx.execute(
+                "UPDATE documents SET purge_at = NULL WHERE id = ?",
+                (doc_id,),
+            )
+            add_audit(
+                tx,
+                actor_id=user["id"],
+                action="purge_canceled",
+                document_id=doc_id,
+                detail=f"封存人取消到期清除（原清除时刻: {previous}）",
+            )
+            result = {"document_id": doc_id, "status": doc["status"], "purge_at": None}
+    if post_commit_error is not None:
+        raise post_commit_error
+    assert result is not None
+    return result
+
+
+# ---------------------------------------------------------------------------
 # 操作记录（按顺序持久保存；非参与方不可见）
 # ---------------------------------------------------------------------------
 
@@ -1395,6 +1769,8 @@ def get_audit(
     db: sqlite3.Connection = Depends(get_db),
     user: sqlite3.Row = Depends(current_user),
 ) -> dict[str, Any]:
+    # 到清除时刻的资料先确定性清除，审计随即包含 purged 记录
+    settle_due_purges_for_read(db, doc_id)
     load_doc_for_participant(db, doc_id, user)
     rows = db.execute(
         """SELECT a.id, a.at, a.action, a.request_id, a.detail,

@@ -60,3 +60,16 @@ class HandoverIn(BaseModel):
         if v.tzinfo is None or v.utcoffset() is None:
             raise ValueError("确认截止时刻必须带时区信息，例如 2026-10-01T12:00:00Z")
         return v
+
+
+class PurgeIn(BaseModel):
+    """封存人为资料安排（或改期）到期清除时刻。"""
+
+    purge_at: datetime  # 到期清除时刻，必须带时区，例如 2026-10-01T12:00:00Z
+
+    @field_validator("purge_at")
+    @classmethod
+    def _aware(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.utcoffset() is None:
+            raise ValueError("清除时刻必须带时区信息，例如 2026-10-01T12:00:00Z")
+        return v

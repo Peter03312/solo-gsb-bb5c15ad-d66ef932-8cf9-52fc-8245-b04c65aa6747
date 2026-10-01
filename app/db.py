@@ -28,8 +28,10 @@ CREATE TABLE IF NOT EXISTS documents (
     owner_id     INTEGER NOT NULL REFERENCES users(id),
     body         TEXT NOT NULL,
     digest       TEXT NOT NULL,
-    status       TEXT NOT NULL CHECK (status IN ('sealed', 'opened')),
+    status       TEXT NOT NULL CHECK (status IN ('sealed', 'opened', 'purged')),
     opened_at    TEXT,
+    purge_at     TEXT,                       -- 可空：计划的到期清除时刻（UTC，可排序）
+    purged_at    TEXT,                       -- 可空：清除生效时刻（= 约定的 purge_at）
     created_at   TEXT NOT NULL
 );
 
@@ -125,6 +127,26 @@ ALTER TABLE open_requests_new RENAME TO open_requests;
 CREATE INDEX IF NOT EXISTS idx_open_requests_document ON open_requests(document_id);
 """
 
+# 旧库迁移（幂等）：documents 的 CHECK 约束不含 purged 时重建表
+# （purge_at / purged_at 两列先由 ALTER TABLE 补齐，重建时随数据一并搬移）
+_MIGRATION_REBUILD_DOCUMENTS = """
+CREATE TABLE documents_new (
+    id           INTEGER PRIMARY KEY,
+    owner_id     INTEGER NOT NULL REFERENCES users(id),
+    body         TEXT NOT NULL,
+    digest       TEXT NOT NULL,
+    status       TEXT NOT NULL CHECK (status IN ('sealed', 'opened', 'purged')),
+    opened_at    TEXT,
+    purge_at     TEXT,
+    purged_at    TEXT,
+    created_at   TEXT NOT NULL
+);
+INSERT INTO documents_new (id, owner_id, body, digest, status, opened_at, purge_at, purged_at, created_at)
+SELECT id, owner_id, body, digest, status, opened_at, purge_at, purged_at, created_at FROM documents;
+DROP TABLE documents;
+ALTER TABLE documents_new RENAME TO documents;
+"""
+
 
 def init_db(db_path: str | None = None) -> None:
     """幂等初始化：创建库表并开启 WAL / 外键（容器初始化时与应用启动时各调用一次也安全）。"""
@@ -143,6 +165,21 @@ def init_db(db_path: str | None = None) -> None:
         if m is None or "'waiting'" not in allowed or "'invalidated'" not in allowed:
             conn.execute("PRAGMA foreign_keys=OFF")
             conn.executescript(_MIGRATION_REBUILD)
+            conn.execute("PRAGMA foreign_keys=ON")
+        # documents 迁移：补 purge_at / purged_at 列，CHECK 不含 purged 时重建表
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(documents)")}
+        if "purge_at" not in cols:
+            conn.execute("ALTER TABLE documents ADD COLUMN purge_at TEXT")
+        if "purged_at" not in cols:
+            conn.execute("ALTER TABLE documents ADD COLUMN purged_at TEXT")
+        sql = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='documents'"
+        ).fetchone()["sql"]
+        m = _WAITING_CHECK.search(sql)
+        allowed = m.group(1).replace('"', "'").lower() if m else ""
+        if m is None or "'purged'" not in allowed:
+            conn.execute("PRAGMA foreign_keys=OFF")
+            conn.executescript(_MIGRATION_REBUILD_DOCUMENTS)
             conn.execute("PRAGMA foreign_keys=ON")
         conn.commit()
     finally:
